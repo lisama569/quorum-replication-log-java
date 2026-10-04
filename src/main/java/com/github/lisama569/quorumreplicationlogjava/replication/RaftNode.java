@@ -289,6 +289,100 @@ public class RaftNode {
         return null;
     }
 
+    // ------------------------------------------------------------------
+    // 客户端一致性读（ReadIndex 风格）
+    // ------------------------------------------------------------------
+
+    /** 当前任期是否已有已提交条目（领导者能否确定自己的提交索引是最新的）。 */
+    private synchronized boolean hasCommittedEntryInCurrentTerm() {
+        return commitIndex > 0 && log.get((int) commitIndex - 1).term() == currentTerm;
+    }
+
+    /**
+     * 客户端一致性读。只返回已经多数派确认的条目，且保证读到发起读之前
+     * 已确认的全部写入（线性一致）。流程：
+     * <ol>
+     *   <li>仅领导者受理；非领导者以 {@link RejectionReason#NOT_LEADER} 失败
+     *       （附已知领导者提示）；</li>
+     *   <li>领导者须已在当前任期提交过条目，否则无法确认自己的提交索引最新，
+     *       以 {@link RejectionReason#NO_LEADER} 失败（选举刚结束的窗口）；</li>
+     *   <li>向多数派发一轮心跳确认领导权仍然有效：够不到多数派以
+     *       {@link RejectionReason#NO_QUORUM} 失败，确认在时限内未完成以
+     *       {@link RejectionReason#READ_CONFIRM_TIMEOUT} 失败——被隔离的旧
+     *       领导者因此不会把本地旧数据当成最新结果返回；</li>
+     *   <li>确认通过后以当前 commitIndex 为 readIndex，返回 [1, readIndex]
+     *       的已提交条目快照与确认时的任期。</li>
+     * </ol>
+     * 读不追加、不修改任何日志条目，失败重试无副作用。
+     */
+    public ReadResult clientRead(Transport transport, List<String> peers, long confirmTimeoutMillis) {
+        final long term;
+        synchronized (this) {
+            if (role != NodeRole.LEADER) {
+                return ReadResult.failed(RejectionReason.NOT_LEADER, knownLeaderId);
+            }
+            if (!hasCommittedEntryInCurrentTerm()) {
+                // 新当选尚未提交本任期条目：提交索引可能落后于集群真实已提交位置
+                return ReadResult.failed(RejectionReason.NO_LEADER, nodeId);
+            }
+            term = currentTerm;
+        }
+
+        long deadline = System.nanoTime() + confirmTimeoutMillis * 1_000_000L;
+        int acks = 1; // 自己一票
+        long quorumAt = -1; // 多数派确认达成的时间点（纳秒）
+        for (String peer : peers) {
+            if (System.nanoTime() > deadline) {
+                break; // 时限已到，不再发起新的确认
+            }
+            final AppendRequest heartbeat;
+            synchronized (this) {
+                if (role != NodeRole.LEADER || currentTerm != term) {
+                    return ReadResult.failed(RejectionReason.NO_LEADER, knownLeaderId);
+                }
+                long next = nextIndex.getOrDefault(peer, lastLogIndex() + 1);
+                long prevIndex = next - 1;
+                long prevTerm = prevIndex > 0 ? log.get((int) prevIndex - 1).term() : 0;
+                List<LogEntry> entries = new ArrayList<>(log.subList((int) next - 1, log.size()));
+                heartbeat = new AppendRequest(term, nodeId, prevIndex, prevTerm, entries, commitIndex);
+            }
+            Optional<AppendResponse> resp = transport.sendAppendRequest(peer, heartbeat);
+            if (resp.isEmpty()) {
+                continue; // 不可达：不计入确认
+            }
+            if (resp.get().term() > term) {
+                stepDown(resp.get().term());
+                return ReadResult.failed(RejectionReason.NO_LEADER, knownLeaderId);
+            }
+            // 同任期响应即确认领导权（即使因日志落后拒绝追加，也证明对方认可本任期）
+            acks++;
+            if (resp.get().success()) {
+                synchronized (this) {
+                    nextIndex.put(peer, resp.get().matchIndex() + 1);
+                }
+            }
+            if (acks >= majority()) {
+                quorumAt = System.nanoTime();
+                break; // 多数派已确认，无需等待其余副本
+            }
+        }
+        if (acks < majority()) {
+            // 始终没凑齐多数派：分区/宕机（不可达即时返回，不会拖到时限）
+            return ReadResult.failed(RejectionReason.NO_QUORUM, nodeId);
+        }
+        if (quorumAt < 0 || quorumAt > deadline) {
+            // 确认在时限之后才凑齐：响应迟迟未回，按超时失败
+            return ReadResult.failed(RejectionReason.READ_CONFIRM_TIMEOUT, nodeId);
+        }
+        synchronized (this) {
+            if (role != NodeRole.LEADER || currentTerm != term) {
+                return ReadResult.failed(RejectionReason.NO_LEADER, knownLeaderId);
+            }
+            long readIndex = commitIndex;
+            return ReadResult.ok(term, readIndex, getCommittedEntries(), nodeId);
+        }
+    }
+
     /**
      * 领导者向所有可达副本复制日志并推进提交索引。
      * 冲突时按 nextIndex 逐条回退重试，直到与副本日志匹配。

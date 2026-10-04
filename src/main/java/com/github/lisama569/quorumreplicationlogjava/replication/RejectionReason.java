@@ -11,5 +11,9 @@ public enum RejectionReason {
     /** 日志在指定索引处冲突（前导条目不匹配）。 */
     LOG_CONFLICT,
     /** 请求的日志索引超出当前日志范围。 */
-    INDEX_OUT_OF_RANGE
+    INDEX_OUT_OF_RANGE,
+    /** 集群暂时没有可确认的领导者（选举进行中，或领导者尚未在当前任期提交过条目）。 */
+    NO_LEADER,
+    /** 读前确认（心跳多数派）在等待时限内未完成。 */
+    READ_CONFIRM_TIMEOUT
 }

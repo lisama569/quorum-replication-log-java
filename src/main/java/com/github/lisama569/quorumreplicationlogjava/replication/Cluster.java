@@ -27,6 +27,10 @@ public class Cluster implements Transport {
     private final Map<String, DurableStore> disks = new HashMap<>();
     /** 断连的节点对（无向，存双向）。 */
     private final Set<Set<String>> linksDown = new HashSet<>();
+    /** 响应方注入的处理延迟（毫秒），用于模拟确认迟迟不回应。 */
+    private final Map<String, Long> latencyMillis = new HashMap<>();
+    /** 一致性读的确认时限（毫秒）。 */
+    private volatile long readConfirmTimeoutMillis = 1000;
     /** 发送方节点 ID（由发送线程在调用前绑定）。 */
     private final ThreadLocal<String> sender = new ThreadLocal<>();
 
@@ -90,6 +94,46 @@ public class Cluster implements Transport {
         }
     }
 
+    /** 以指定节点身份发起一次一致性读（绑定发送方，用于分区判定）。 */
+    public ReadResult read(String nodeId) {
+        sender.set(nodeId);
+        try {
+            RaftNode node = nodes.get(nodeId);
+            return node.clientRead(this, peersOf(nodeId), readConfirmTimeoutMillis);
+        } finally {
+            sender.remove();
+        }
+    }
+
+    /** 设置一致性读的确认时限（毫秒）。 */
+    public void setReadConfirmTimeoutMillis(long millis) {
+        this.readConfirmTimeoutMillis = millis;
+    }
+
+    /** 给某节点的响应注入处理延迟（毫秒），模拟确认迟迟不回应。 */
+    public synchronized void setLatency(String nodeId, long millis) {
+        latencyMillis.put(nodeId, millis);
+    }
+
+    /** 清除某节点的注入延迟。 */
+    public synchronized void clearLatency(String nodeId) {
+        latencyMillis.remove(nodeId);
+    }
+
+    private void applyLatency(String targetId) {
+        long delay;
+        synchronized (this) {
+            delay = latencyMillis.getOrDefault(targetId, 0L);
+        }
+        if (delay > 0) {
+            try {
+                Thread.sleep(delay);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
     /** 断开两个节点间的通信（双向）。 */
     public synchronized void disconnect(String a, String b) {
         linksDown.add(Set.of(a, b));
@@ -135,6 +179,7 @@ public class Cluster implements Transport {
         if (from == null || !reachable(from, targetId)) {
             return Optional.empty();
         }
+        applyLatency(targetId);
         return Optional.of(nodes.get(targetId).handleVoteRequest(request));
     }
 
@@ -144,6 +189,7 @@ public class Cluster implements Transport {
         if (from == null || !reachable(from, targetId)) {
             return Optional.empty();
         }
+        applyLatency(targetId);
         return Optional.of(nodes.get(targetId).handleAppendRequest(request));
     }
 }
