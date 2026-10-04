@@ -8,14 +8,17 @@
 
 ```
 src/main/java/com/github/lisama569/quorumreplicationlogjava/replication/
-├── RaftNode.java            节点核心：选举、日志复制、提交推进、幂等写入
-├── Cluster.java             进程内集群：消息路由、分区/重启模拟（实现 Transport）
+├── RaftNode.java            节点核心：选举、日志复制、提交推进、幂等写入、一致性读
+├── Cluster.java             进程内集群：消息路由、分区/重启/延迟模拟（实现 Transport）
 ├── Transport.java           节点间通信抽象（不可达 = Optional.empty）
 ├── DurableStore.java        持久化状态抽象（任期、投票、日志）
 ├── InMemoryDurableStore.java 进程内“磁盘”，重启节点时复用以模拟持久化
 ├── LogEntry.java            日志条目 (term, index, requestId, payload)
 ├── VoteRequest/VoteResponse   投票消息
 ├── AppendRequest/AppendResponse 复制（含心跳）消息
+├── ReadConfirmRequest/ReadConfirmResponse 读前领导者确认消息
+├── ReadResult.java          读结果（任期 + 读位置 + 条目 / 可区分失败原因）
+├── ReadFailureReason.java   NO_LEADER / NOT_LEADER / NO_QUORUM / CONFIRM_TIMEOUT
 ├── WriteResult.java         写入结果（受理/拒绝 + 可区分原因）
 ├── NodeRole.java            FOLLOWER / CANDIDATE / LEADER
 └── RejectionReason.java     NOT_LEADER / NO_QUORUM / STALE_TERM /
@@ -33,6 +36,54 @@ src/main/java/com/github/lisama569/quorumreplicationlogjava/replication/
   各副本收敛到同一日志序列（测试中以逐条相等断言验证）。
 - **幂等写入**：每个客户端请求携带 `requestId`，重复提交返回首次写入
   的日志索引，不会被重复应用。
+
+## 一致性读（客户端读已提交日志）
+
+面向客户端的读接口 `RaftNode.clientRead`（集群侧入口 `Cluster.read`），
+采用 ReadIndex 风格：**读之前先确认，确认不过就失败**，绝不退回本地数据。
+
+### 读的流程
+
+1. **仅领导者受理**。跟随者/候选人直接失败并给出领导者提示
+   （`leaderId`），便于客户端重定向；
+2. **读前确认轮**：领导者向所有副本并行发送 `ReadConfirmRequest`
+   （心跳语义），在 `confirmTimeoutMillis` 内集齐多数派确认，
+   核实自己仍是当前任期的有效领导者；
+3. **提交位置恢复**：确认响应携带各副本已知的 `commitIndex`，领导者采纳
+   其中的最大值（这些值都源自合法的多数派提交，采纳是安全的）——
+   重启或新当选的领导者借此追上换主前已确认的位置；
+4. **返回一致快照**：截至 `commitIndex` 的已提交条目，结果中带有
+   `term`（读发生时的领导者任期）与 `readIndex`（读到第几条日志），
+   便于排查与复现。
+
+### 读的一致性保证
+
+- **写后必读**：发起读之前已被确认（多数派提交）的写入，读时一定可见；
+  写入确认后领导者会补发一轮携带最新 `leaderCommit` 的心跳，使换主后的
+  新领导者也能经确认轮恢复该位置；
+- **不会读到旧值**：被隔离在少数派的旧领导者无法通过多数派确认，
+  读直接失败，不会把本地旧数据当成最新结果返回；
+- **读不改日志**：读及确认轮不追加任何条目，失败重试无副作用；
+- **并发安全**：读写混跑时，成功的读不落后于读开始前已确认的位置，
+  同一读者的读位置单调不退，日志无空洞、错位或重复。
+
+### 读失败分类（彼此可区分）
+
+| 原因 | 含义 | 典型场景 |
+|---|---|---|
+| `NO_LEADER` | 集群暂时没有可确认的领导者 | 尚未选举、选举进行中（候选人已不信任旧领导者） |
+| `NOT_LEADER` | 本节点不是领导者，`leaderId` 给出重定向提示 | 客户端打到跟随者；确认期间发现更高任期而退位 |
+| `NO_QUORUM` | 确认轮结束但确认数不足多数派 | 领导者被隔离在少数派、多数副本不可达 |
+| `CONFIRM_TIMEOUT` | 超时时间内未集齐多数派确认 | 网络延迟过大、确认消息迟迟无回应 |
+
+### 适用范围（分区 / 重启 / 选举）
+
+- **分区**：少数派一侧的读以 `NO_QUORUM` 失败；多数派一侧的领导者
+  正常服务读，结果包含分区前全部已确认写入；
+- **重启**：重启的领导者本地 `commitIndex` 归零，重新当选后第一次读的
+  确认轮即从多数派上报中恢复提交位置，重启前已确认的写入仍然可见；
+- **选举**：选举窗口内没有可确认的领导者，读以 `NO_LEADER` 失败；
+  窗口结束后新领导者经确认轮即可服务读，无需等待新的写入。
 
 ## 选举与冲突解决规则
 
@@ -88,6 +139,27 @@ mvn test
 | `restartedNodeCatchesUpAndCommittedWritesSurvive` | 跟随者/领导者重启后日志恢复、补齐提交索引、可重新当选 |
 | `duplicateRequestIdIsAppliedOnlyOnce` | 相同 `requestId` 重试返回相同索引，仅应用一次 |
 | `concurrentWritesGetUniqueOrderedIndexesAndConverge` | 8 线程并发写入索引唯一连续，全部副本收敛 |
+
+`ConsistentReadTest` 覆盖一致性读的 6 个场景，测试日志以
+`[case]`/`[read]`/`[assert]` 前缀打印每次读的任期、读位置（readIndex）、
+失败原因与判定依据：
+
+| 测试 | 验证点 |
+|---|---|
+| `readAfterCommittedWriteSeesItWithTermAndPosition` | 写完即读可见；结果带 term/readIndex；跟随者读 `NOT_LEADER` 并给重定向提示 |
+| `isolatedOldLeaderCannotServeStaleReads` | 被隔离旧领导者读失败 `NO_QUORUM` 而非返回本地旧数据；新领导者读到换主前后全部已确认写入 |
+| `readFailuresAreDistinctAndNeverFallBackToLocalData` | `NO_LEADER` / `NO_QUORUM` / `CONFIRM_TIMEOUT` 可区分；失败读不夹带本地数据、重试无副作用 |
+| `readDuringElectionWindowFailsCleanlyWithoutSideEffects` | 选举窗口内读失败 `NO_LEADER`，不改日志；窗口结束后读恢复一致 |
+| `concurrentReadsNeverSeeStaleOrTornLog` | 4 读者与写者并发：读不落后于读前已确认位置、读位置单调、日志无空洞/错位/重复 |
+| `restartedLeaderReadRecoversCommittedPositionViaQuorum` | 领导者重启重选后，确认轮恢复提交位置，重启前已确认写入可见 |
+
+本地验证：
+
+```bash
+mvn test                                        # 全部测试（含原有 8 个回归）
+mvn test -Dtest=ConsistentReadTest              # 只跑一致性读场景
+mvn test -Dtest=ConsistentReadTest | grep -E "\[case\]|\[read\]|\[assert\]"  # 查看场景覆盖与判定依据
+```
 
 ## 运行
 

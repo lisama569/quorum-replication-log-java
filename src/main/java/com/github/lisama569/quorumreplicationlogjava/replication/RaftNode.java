@@ -127,6 +127,7 @@ public class RaftNode {
             role = NodeRole.CANDIDATE;
             currentTerm++;
             votedFor = nodeId;
+            knownLeaderId = null; // 发起选举即不再信任旧领导者的有效性
             persistTermAndVote();
             term = currentTerm;
             lastIdx = lastLogIndex();
@@ -242,6 +243,124 @@ public class RaftNode {
     }
 
     // ------------------------------------------------------------------
+    // 客户端一致性读
+    // ------------------------------------------------------------------
+
+    /** 读确认使用的守护线程池（传输调用在锁外并行执行）。 */
+    private static final java.util.concurrent.ExecutorService CONFIRM_EXECUTOR =
+            java.util.concurrent.Executors.newCachedThreadPool(r -> {
+                Thread t = new Thread(r, "read-confirm");
+                t.setDaemon(true);
+                return t;
+            });
+
+    /**
+     * 处理读前领导者确认请求（心跳语义）。
+     * 过期任期拒绝（STALE_TERM）；否则退位为跟随者、记录已知领导者，
+     * 并上报自己已知的提交索引与日志末尾，供领导者恢复提交进度。
+     */
+    public synchronized ReadConfirmResponse handleReadConfirmRequest(ReadConfirmRequest request) {
+        if (request.term() < currentTerm) {
+            return new ReadConfirmResponse(currentTerm, false, commitIndex, lastLogIndex(),
+                    RejectionReason.STALE_TERM);
+        }
+        if (request.term() > currentTerm || role != NodeRole.FOLLOWER) {
+            stepDown(request.term());
+        }
+        knownLeaderId = request.leaderId();
+        return new ReadConfirmResponse(currentTerm, true, commitIndex, lastLogIndex(), null);
+    }
+
+    /**
+     * 客户端一致性读（ReadIndex 风格）。
+     *
+     * <p>语义：仅领导者受理；先用确认请求向多数派核实自己仍是当前任期的
+     * 有效领导者，核实通过后才返回截至 commitIndex 的已提交条目。被隔离的
+     * 旧领导者无法通过多数派核实，因此读要么返回最新一致结果，要么失败，
+     * 绝不退回本地旧数据。读不修改日志，失败重试无副作用。
+     *
+     * <p>失败分类：非领导者（{@link ReadFailureReason#NOT_LEADER}，
+     * 无已知领导者时为 {@link ReadFailureReason#NO_LEADER}）、
+     * 多数派不可达（{@link ReadFailureReason#NO_QUORUM}）、
+     * 确认超时（{@link ReadFailureReason#CONFIRM_TIMEOUT}）。
+     *
+     * @param confirmTimeoutMillis 等待多数派确认的最长时间
+     */
+    public ReadResult clientRead(Transport transport, List<String> peers, long confirmTimeoutMillis) {
+        final long term;
+        synchronized (this) {
+            if (role != NodeRole.LEADER) {
+                return ReadResult.failed(
+                        knownLeaderId == null ? ReadFailureReason.NO_LEADER : ReadFailureReason.NOT_LEADER,
+                        knownLeaderId);
+            }
+            term = currentTerm;
+        }
+        ReadConfirmRequest request = new ReadConfirmRequest(term, nodeId);
+        List<java.util.concurrent.CompletableFuture<Optional<ReadConfirmResponse>>> futures =
+                peers.stream()
+                        .map(p -> java.util.concurrent.CompletableFuture.supplyAsync(
+                                () -> transport.sendReadConfirm(p, request), CONFIRM_EXECUTOR))
+                        .toList();
+
+        int confirmed = 1; // 自己一票
+        long adoptedCommit = -1;
+        boolean timedOut = false;
+        long deadline = System.nanoTime()
+                + java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(Math.max(0, confirmTimeoutMillis));
+        for (var future : futures) {
+            long remaining = deadline - System.nanoTime();
+            if (remaining <= 0) {
+                timedOut = true;
+                break;
+            }
+            final Optional<ReadConfirmResponse> resp;
+            try {
+                resp = future.get(remaining, java.util.concurrent.TimeUnit.NANOSECONDS);
+            } catch (java.util.concurrent.TimeoutException e) {
+                timedOut = true;
+                break;
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                timedOut = true;
+                break;
+            } catch (java.util.concurrent.ExecutionException e) {
+                continue; // 单个副本异常按未确认处理
+            }
+            if (resp.isEmpty()) {
+                continue; // 不可达
+            }
+            if (resp.get().term() > term) {
+                stepDown(resp.get().term());
+                synchronized (this) {
+                    return ReadResult.failed(ReadFailureReason.NOT_LEADER, knownLeaderId);
+                }
+            }
+            if (resp.get().confirmed()) {
+                confirmed++;
+                adoptedCommit = Math.max(adoptedCommit, resp.get().commitIndex());
+            }
+        }
+
+        if (confirmed < majority()) {
+            return ReadResult.failed(
+                    timedOut ? ReadFailureReason.CONFIRM_TIMEOUT : ReadFailureReason.NO_QUORUM, nodeId);
+        }
+        synchronized (this) {
+            // 确认期间可能已退位（如发现更高任期），退位后不得再提供读
+            if (role != NodeRole.LEADER || currentTerm != term) {
+                return ReadResult.failed(ReadFailureReason.NOT_LEADER, knownLeaderId);
+            }
+            // 提交进度恢复：多数派上报的 commitIndex 均源自合法的多数派提交，
+            // 采纳其最大值是安全的（重启/新当选的领导者借此追上已提交位置）。
+            if (adoptedCommit > commitIndex) {
+                commitIndex = Math.min(adoptedCommit, lastLogIndex());
+            }
+            return ReadResult.ok(term, commitIndex, getCommittedEntries(), nodeId);
+        }
+    }
+
+    // ------------------------------------------------------------------
     // 客户端写入
     // ------------------------------------------------------------------
 
@@ -292,6 +411,8 @@ public class RaftNode {
     /**
      * 领导者向所有可达副本复制日志并推进提交索引。
      * 冲突时按 nextIndex 逐条回退重试，直到与副本日志匹配。
+     * 提交索引推进后再补一轮心跳，让副本尽快得知最新的 leaderCommit，
+     * 这样已确认的写入对后续（可能换主的）一致性读立即可见。
      */
     public void replicate(Transport transport, List<String> peers) {
         final long term;
@@ -301,6 +422,22 @@ public class RaftNode {
             }
             term = currentTerm;
         }
+        replicateRound(transport, peers, term);
+        long committedBefore;
+        synchronized (this) {
+            committedBefore = commitIndex;
+        }
+        advanceCommitIndex(term);
+        synchronized (this) {
+            if (role == NodeRole.LEADER && currentTerm == term && commitIndex > committedBefore) {
+                // 提交索引有推进：广播携带新 leaderCommit 的心跳
+                replicateRound(transport, peers, term);
+            }
+        }
+    }
+
+    /** 单轮复制：对每个副本按需回退 nextIndex 直至追加成功或不可达。 */
+    private void replicateRound(Transport transport, List<String> peers, long term) {
         for (String peer : peers) {
             while (true) {
                 final AppendRequest request;
@@ -338,7 +475,6 @@ public class RaftNode {
                 }
             }
         }
-        advanceCommitIndex(term);
     }
 
     /** 仅提交当前任期内、已复制到多数派的条目（Raft 安全提交规则）。 */

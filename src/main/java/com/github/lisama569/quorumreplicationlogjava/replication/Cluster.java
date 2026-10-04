@@ -29,6 +29,8 @@ public class Cluster implements Transport {
     private final Set<Set<String>> linksDown = new HashSet<>();
     /** 发送方节点 ID（由发送线程在调用前绑定）。 */
     private final ThreadLocal<String> sender = new ThreadLocal<>();
+    /** 读确认消息的人工延迟（毫秒，默认 0），用于模拟确认迟迟无回应。 */
+    private volatile long readConfirmDelayMillis;
 
     public Cluster(List<String> nodeIds) {
         this.nodeIds = List.copyOf(nodeIds);
@@ -90,6 +92,51 @@ public class Cluster implements Transport {
         }
     }
 
+    /** 以指定节点身份发起一次一致性读（绑定发送方，用于分区判定）。 */
+    public com.github.lisama569.quorumreplicationlogjava.replication.ReadResult read(
+            String nodeId, long confirmTimeoutMillis) {
+        RaftNode node = nodes.get(nodeId);
+        // 读确认在节点内部的并行线程中发出，ThreadLocal 无法随之传播，
+        // 因此包装一个每次调用都重新绑定发送方的 Transport。
+        Transport bound = new Transport() {
+            @Override
+            public Optional<VoteResponse> sendVoteRequest(String targetId, VoteRequest request) {
+                sender.set(nodeId);
+                try {
+                    return Cluster.this.sendVoteRequest(targetId, request);
+                } finally {
+                    sender.remove();
+                }
+            }
+
+            @Override
+            public Optional<AppendResponse> sendAppendRequest(String targetId, AppendRequest request) {
+                sender.set(nodeId);
+                try {
+                    return Cluster.this.sendAppendRequest(targetId, request);
+                } finally {
+                    sender.remove();
+                }
+            }
+
+            @Override
+            public Optional<ReadConfirmResponse> sendReadConfirm(String targetId, ReadConfirmRequest request) {
+                sender.set(nodeId);
+                try {
+                    return Cluster.this.sendReadConfirm(targetId, request);
+                } finally {
+                    sender.remove();
+                }
+            }
+        };
+        return node.clientRead(bound, peersOf(nodeId), confirmTimeoutMillis);
+    }
+
+    /** 模拟读确认消息的网络延迟（毫秒），用于验证确认超时路径。 */
+    public void setReadConfirmDelayMillis(long delayMillis) {
+        this.readConfirmDelayMillis = delayMillis;
+    }
+
     /** 断开两个节点间的通信（双向）。 */
     public synchronized void disconnect(String a, String b) {
         linksDown.add(Set.of(a, b));
@@ -145,5 +192,23 @@ public class Cluster implements Transport {
             return Optional.empty();
         }
         return Optional.of(nodes.get(targetId).handleAppendRequest(request));
+    }
+
+    @Override
+    public Optional<ReadConfirmResponse> sendReadConfirm(String targetId, ReadConfirmRequest request) {
+        String from = sender.get();
+        if (from == null || !reachable(from, targetId)) {
+            return Optional.empty();
+        }
+        long delay = readConfirmDelayMillis;
+        if (delay > 0) {
+            try {
+                Thread.sleep(delay); // 模拟确认消息在网络中迟迟未得到回应
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return Optional.empty();
+            }
+        }
+        return Optional.of(nodes.get(targetId).handleReadConfirmRequest(request));
     }
 }
