@@ -242,6 +242,31 @@ public class RaftNode {
     }
 
     // ------------------------------------------------------------------
+    // 读前确认（无副作用心跳）
+    // ------------------------------------------------------------------
+
+    /**
+     * 处理读前确认请求。只校验任期与领导权归属：
+     * <ul>
+     *   <li>请求任期过期：不认可，回报当前任期；</li>
+     *   <li>请求任期更高：退位并更新任期（安全性必需，不触碰日志）；</li>
+     *   <li>同任期：认可该领导者，候选人/领导者退位为跟随者。</li>
+     * </ul>
+     * 本方法不追加、不截断任何日志条目，不推进 commitIndex——
+     * 日志内容与已提交位置只能由真正的写入与复制推进。
+     */
+    public synchronized ReadConfirmResponse handleReadConfirm(ReadConfirmRequest request) {
+        if (request.term() < currentTerm) {
+            return new ReadConfirmResponse(currentTerm, false);
+        }
+        if (request.term() > currentTerm || role != NodeRole.FOLLOWER) {
+            stepDown(request.term());
+        }
+        knownLeaderId = request.leaderId();
+        return new ReadConfirmResponse(currentTerm, true);
+    }
+
+    // ------------------------------------------------------------------
     // 客户端写入
     // ------------------------------------------------------------------
 
@@ -306,14 +331,17 @@ public class RaftNode {
      *       （附已知领导者提示）；</li>
      *   <li>领导者须已在当前任期提交过条目，否则无法确认自己的提交索引最新，
      *       以 {@link RejectionReason#NO_LEADER} 失败（选举刚结束的窗口）；</li>
-     *   <li>向多数派发一轮心跳确认领导权仍然有效：够不到多数派以
+     *   <li>向多数派发一轮<b>无副作用的读前确认</b>（{@link ReadConfirmRequest}，
+     *       不携带日志条目与 leaderCommit）确认领导权仍然有效：够不到多数派以
      *       {@link RejectionReason#NO_QUORUM} 失败，确认在时限内未完成以
      *       {@link RejectionReason#READ_CONFIRM_TIMEOUT} 失败——被隔离的旧
      *       领导者因此不会把本地旧数据当成最新结果返回；</li>
      *   <li>确认通过后以当前 commitIndex 为 readIndex，返回 [1, readIndex]
      *       的已提交条目快照与确认时的任期。</li>
      * </ol>
-     * 读不追加、不修改任何日志条目，失败重试无副作用。
+     * 读不追加、不修改任何节点的日志条目，不推进任何节点的 commitIndex，
+     * 不改写 nextIndex；日志与已提交位置只能由真正的写入和复制推进。
+     * 读无论成功还是失败都可安全重试，重试前后各节点状态完全一致。
      */
     public ReadResult clientRead(Transport transport, List<String> peers, long confirmTimeoutMillis) {
         final long term;
@@ -331,22 +359,17 @@ public class RaftNode {
         long deadline = System.nanoTime() + confirmTimeoutMillis * 1_000_000L;
         int acks = 1; // 自己一票
         long quorumAt = -1; // 多数派确认达成的时间点（纳秒）
+        ReadConfirmRequest confirm = new ReadConfirmRequest(term, nodeId);
         for (String peer : peers) {
             if (System.nanoTime() > deadline) {
                 break; // 时限已到，不再发起新的确认
             }
-            final AppendRequest heartbeat;
             synchronized (this) {
                 if (role != NodeRole.LEADER || currentTerm != term) {
                     return ReadResult.failed(RejectionReason.NO_LEADER, knownLeaderId);
                 }
-                long next = nextIndex.getOrDefault(peer, lastLogIndex() + 1);
-                long prevIndex = next - 1;
-                long prevTerm = prevIndex > 0 ? log.get((int) prevIndex - 1).term() : 0;
-                List<LogEntry> entries = new ArrayList<>(log.subList((int) next - 1, log.size()));
-                heartbeat = new AppendRequest(term, nodeId, prevIndex, prevTerm, entries, commitIndex);
             }
-            Optional<AppendResponse> resp = transport.sendAppendRequest(peer, heartbeat);
+            Optional<ReadConfirmResponse> resp = transport.sendReadConfirm(peer, confirm);
             if (resp.isEmpty()) {
                 continue; // 不可达：不计入确认
             }
@@ -354,12 +377,8 @@ public class RaftNode {
                 stepDown(resp.get().term());
                 return ReadResult.failed(RejectionReason.NO_LEADER, knownLeaderId);
             }
-            // 同任期响应即确认领导权（即使因日志落后拒绝追加，也证明对方认可本任期）
-            acks++;
-            if (resp.get().success()) {
-                synchronized (this) {
-                    nextIndex.put(peer, resp.get().matchIndex() + 1);
-                }
+            if (resp.get().acknowledged()) {
+                acks++;
             }
             if (acks >= majority()) {
                 quorumAt = System.nanoTime();

@@ -16,6 +16,8 @@ src/main/java/com/github/lisama569/quorumreplicationlogjava/replication/
 ├── LogEntry.java            日志条目 (term, index, requestId, payload)
 ├── VoteRequest/VoteResponse   投票消息
 ├── AppendRequest/AppendResponse 复制（含心跳）消息
+├── ReadConfirmRequest/ReadConfirmResponse 读前确认消息（无副作用心跳：
+│                              不携带日志条目与 leaderCommit）
 ├── WriteResult.java         写入结果（受理/拒绝 + 可区分原因）
 ├── ReadResult.java          一致性读结果（读到的任期/日志位置 + 可区分失败原因）
 ├── NodeRole.java            FOLLOWER / CANDIDATE / LEADER
@@ -53,9 +55,31 @@ src/main/java/com/github/lisama569/quorumreplicationlogjava/replication/
 1. 仅领导者受理；非领导者以 `NOT_LEADER` 失败并附已知领导者提示；
 2. 领导者须已在**当前任期**提交过条目，否则无法确认自己的提交索引
    是最新的，以 `NO_LEADER` 失败（新当选尚未有写入确认的窗口）；
-3. 领导者向各副本发一轮心跳确认领导权仍然有效：凑齐多数派（含自己）
-   才放行读；多数派确认在时限内完成后即可短路返回，不等慢副本；
+3. 领导者向各副本发一轮**专用的读前确认**（`ReadConfirmRequest`）
+   确认领导权仍然有效：凑齐多数派（含自己）才放行读；多数派确认在
+   时限内完成后即可短路返回，不等慢副本；
 4. 确认通过后以当前 `commitIndex` 为 `readIndex`，返回已提交条目快照。
+
+### 读的零副作用保证
+
+读与日志复制使用**两条完全独立的消息通道**：
+
+- 读前确认（`ReadConfirmRequest`）只携带 `(term, leaderId)`，**不携带
+  任何日志条目，也不携带 leaderCommit**；接收方只校验任期与领导权归属，
+  绝不追加/截断日志、绝不推进 commitIndex；
+- 日志内容与已提交位置只能由真正的客户端写入（`clientWrite`）和日志
+  复制（`replicate`/`handleAppendRequest`）推进。
+
+因此无论读成功还是失败、重试多少次：
+
+- 任何节点的日志内容、条目数量、commitIndex 都不会因读而改变
+  （落后副本恢复连通后发生读，其日志与已提交位置保持原样，直到下一次
+  真正的复制才被补齐）；
+- 客户端已收到失败（如 `NO_QUORUM`）的未确认写入，不会因为一次读而
+  出现在其他副本的日志里；
+- 领导者自己的复制进度状态（nextIndex）也不被读改写；
+- 唯一的例外是安全性必需的状态迁移：确认过程中发现更高任期时退位为
+  FOLLOWER（这不触碰日志与已提交位置）。
 
 ### 读失败分类（彼此可区分，绝不回退为本地旧数据）
 
@@ -74,17 +98,23 @@ src/main/java/com/github/lisama569/quorumreplicationlogjava/replication/
 `Cluster.setLatency(nodeId, ms)` 给副本响应注入延迟、配合
 `Cluster.setReadConfirmTimeoutMillis(ms)` 复现 `READ_CONFIRM_TIMEOUT`；
 不选举直接读或选举后隔离候选人复现 `NOT_LEADER`；新当选未写入时读
-复现 `NO_LEADER`。以上均由 `ConsistentReadTest` 自动化覆盖。
+复现 `NO_LEADER`。以上均由 `ConsistentReadTest` 自动化覆盖；
+读的零副作用（含落后副本恢复、被拒绝写入不泄漏、失败重试无残留）
+由 `ReadSideEffectFreeTest` 以“读前后全节点 (role, term, commitIndex,
+log) 快照逐字段比对”的方式覆盖。
 
 ### 适用范围与副作用
 
 - **分区**：少数派一侧读失败（`NO_QUORUM`）；多数派一侧读正常。
+  分区恢复后，落后副本的日志与 commitIndex 不会被读顺手补齐——
+  只有领导者下一轮真正的复制才能推进它们。
 - **重启**：重启后角色归零为 FOLLOWER，读以 `NOT_LEADER` 失败；重新
   当选并提交本任期条目后恢复可读。
 - **选举窗口**：候选人/未确认领导者读失败（`NOT_LEADER`/`NO_LEADER`），
-  不会返回未经验证的数据。
-- **读写并发**：读不追加、不修改任何日志条目，不推进提交索引，不改变
-  任期；失败重试无副作用。同一读者的连续读位置单调不回退。
+  不会返回未经验证的数据，也不会为确认领导权而伪造日志条目。
+- **读写并发**：读不追加、不修改任何节点的日志条目，不推进任何节点的
+  提交索引，不改变任期；失败重试零副作用，重试前后各节点状态完全一致。
+  同一读者的连续读位置单调不回退。
 
 ## 选举与冲突解决规则
 
@@ -128,8 +158,9 @@ mvn test
 ```
 
 `QuorumReplicationTest` 覆盖 8 个场景，`ConsistentReadTest` 覆盖 5 个
-一致性读场景，测试日志打印任期、日志索引/读位置与判定依据
-（`[case]`/`[state]`/`[read]`/`[assert]` 前缀）：
+一致性读场景，`ReadSideEffectFreeTest` 覆盖 4 个读的零副作用场景，
+测试日志打印任期、日志索引/读位置与判定依据
+（`[case]`/`[state]`/`[read]`/`[snapshot]`/`[assert]` 前缀）：
 
 | 测试 | 验证点 |
 |---|---|
@@ -146,6 +177,10 @@ mvn test
 | `readFailureReasonsAreDistinctAndRetryHasNoSideEffects` | `NOT_LEADER`/`NO_QUORUM`/`READ_CONFIRM_TIMEOUT` 可区分；失败重试无副作用 |
 | `readDuringElectionAndUnconfirmedLeaderWindow` | 选举进行中读失败 `NOT_LEADER`；未确认领导者读失败 `NO_LEADER`；确认后读成功 |
 | `concurrentReadsAndWritesStayLinearizable` | 并发读写下读到的均为连续前缀、读位置单调不回退；读不产生额外日志条目 |
+| `readAfterLaggingFollowerReconnectsDoesNotMutateAnyReplica` | 落后副本恢复连通后发读：读成功看到全部已确认写入，但任何副本的日志/commitIndex 均不被读改动；只有显式复制才补齐 |
+| `rejectedWriteDoesNotLeakToOtherReplicasViaRead` | 客户端已收到 `NO_QUORUM` 失败的写入，不因后续一次读而出现在其他副本日志里 |
+| `failedReadRetriesLeaveAllNodesUntouched` | `NOT_LEADER`/`NO_QUORUM`/`READ_CONFIRM_TIMEOUT` 各重试 3 次，全节点快照逐字段一致；恢复后读成功 |
+| `readOnUnconfirmedLeaderFailsWithoutTouchingAnything` | 未确认领导者读失败 `NO_LEADER`，且不为确认领导权伪造日志条目 |
 
 ## 运行
 

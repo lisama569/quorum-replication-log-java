@@ -192,4 +192,14 @@ public class Cluster implements Transport {
         applyLatency(targetId);
         return Optional.of(nodes.get(targetId).handleAppendRequest(request));
     }
+
+    @Override
+    public Optional<ReadConfirmResponse> sendReadConfirm(String targetId, ReadConfirmRequest request) {
+        String from = sender.get();
+        if (from == null || !reachable(from, targetId)) {
+            return Optional.empty();
+        }
+        applyLatency(targetId);
+        return Optional.of(nodes.get(targetId).handleReadConfirm(request));
+    }
 }
