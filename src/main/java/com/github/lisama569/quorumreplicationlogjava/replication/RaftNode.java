@@ -293,6 +293,23 @@ public class RaftNode {
     // 客户端一致性读（ReadIndex 风格）
     // ------------------------------------------------------------------
 
+    /**
+     * 处理读前领导权确认（ReadIndex 流程的只读 RPC）。
+     *
+     * <p><b>严格无副作用</b>：不追加/截断日志、不推进 commitIndex、不改任期、
+     * 不改角色、不更新已知领导者、不落盘。它不承担心跳的任何职责（心跳推进
+     * 提交位置的副作用只能来自真正的复制流程 {@link #replicate}）。
+     *
+     * <p>认可规则：请求任期不旧于本节点当前任期即 grant（过期领导者的请求
+     * 任期更小，必然被多数派拒绝）；响应回带本节点当前任期，供发起方发现
+     * 更高任期后自行退位（退位是发起方读失败路径上的本地修正，不是响应方
+     * 对本 RPC 做出的状态改变）。
+     */
+    public synchronized ReadConfirmResponse handleReadConfirm(ReadConfirmRequest request) {
+        boolean grant = request.term() >= currentTerm;
+        return new ReadConfirmResponse(currentTerm, grant);
+    }
+
     /** 当前任期是否已有已提交条目（领导者能否确定自己的提交索引是最新的）。 */
     private synchronized boolean hasCommittedEntryInCurrentTerm() {
         return commitIndex > 0 && log.get((int) commitIndex - 1).term() == currentTerm;
@@ -306,17 +323,22 @@ public class RaftNode {
      *       （附已知领导者提示）；</li>
      *   <li>领导者须已在当前任期提交过条目，否则无法确认自己的提交索引最新，
      *       以 {@link RejectionReason#NO_LEADER} 失败（选举刚结束的窗口）；</li>
-     *   <li>向多数派发一轮心跳确认领导权仍然有效：够不到多数派以
-     *       {@link RejectionReason#NO_QUORUM} 失败，确认在时限内未完成以
-     *       {@link RejectionReason#READ_CONFIRM_TIMEOUT} 失败——被隔离的旧
-     *       领导者因此不会把本地旧数据当成最新结果返回；</li>
+     *   <li>向各副本发一轮<b>只读确认</b> {@link ReadConfirmRequest}（不含任何
+     *       日志条目、不含 leaderCommit）验证领导权仍然有效：该消息在发送方与
+     *       响应方都<b>零副作用</b>——不追加/截断日志、不推进提交索引、不改
+     *       nextIndex、不改任期与角色；</li>
+     *   <li>够不到多数派（不可达/不认可）以 {@link RejectionReason#NO_QUORUM}
+     *       失败，确认在时限之后才凑齐以 {@link RejectionReason#READ_CONFIRM_TIMEOUT}
+     *       失败——被隔离的旧领导者因此不会把本地旧数据当成最新结果返回；</li>
      *   <li>确认通过后以当前 commitIndex 为 readIndex，返回 [1, readIndex]
      *       的已提交条目快照与确认时的任期。</li>
      * </ol>
-     * 读不追加、不修改任何日志条目，失败重试无副作用。
+     * 无论成功还是失败、无论重试多少次，读都不改变任何节点（含本节点）的
+     * 日志内容、条目数量、已提交位置、任期与角色。
      */
     public ReadResult clientRead(Transport transport, List<String> peers, long confirmTimeoutMillis) {
         final long term;
+        final long readIndex;
         synchronized (this) {
             if (role != NodeRole.LEADER) {
                 return ReadResult.failed(RejectionReason.NOT_LEADER, knownLeaderId);
@@ -326,60 +348,55 @@ public class RaftNode {
                 return ReadResult.failed(RejectionReason.NO_LEADER, nodeId);
             }
             term = currentTerm;
+            readIndex = commitIndex;
         }
 
+        ReadConfirmRequest confirm = new ReadConfirmRequest(term, nodeId);
         long deadline = System.nanoTime() + confirmTimeoutMillis * 1_000_000L;
         int acks = 1; // 自己一票
-        long quorumAt = -1; // 多数派确认达成的时间点（纳秒）
+        long quorumAt = acks >= majority() ? System.nanoTime() : -1;
         for (String peer : peers) {
-            if (System.nanoTime() > deadline) {
-                break; // 时限已到，不再发起新的确认
+            if (acks >= majority() || System.nanoTime() > deadline) {
+                break; // 已凑齐多数派，或时限已到不再发起新的确认
             }
-            final AppendRequest heartbeat;
-            synchronized (this) {
-                if (role != NodeRole.LEADER || currentTerm != term) {
-                    return ReadResult.failed(RejectionReason.NO_LEADER, knownLeaderId);
-                }
-                long next = nextIndex.getOrDefault(peer, lastLogIndex() + 1);
-                long prevIndex = next - 1;
-                long prevTerm = prevIndex > 0 ? log.get((int) prevIndex - 1).term() : 0;
-                List<LogEntry> entries = new ArrayList<>(log.subList((int) next - 1, log.size()));
-                heartbeat = new AppendRequest(term, nodeId, prevIndex, prevTerm, entries, commitIndex);
-            }
-            Optional<AppendResponse> resp = transport.sendAppendRequest(peer, heartbeat);
+            Optional<ReadConfirmResponse> resp = transport.sendReadConfirm(peer, confirm);
             if (resp.isEmpty()) {
                 continue; // 不可达：不计入确认
             }
             if (resp.get().term() > term) {
+                // 发现更高任期：领导者身份已过期，本地退位并失败（仅此一处本地修正）
                 stepDown(resp.get().term());
                 return ReadResult.failed(RejectionReason.NO_LEADER, knownLeaderId);
             }
-            // 同任期响应即确认领导权（即使因日志落后拒绝追加，也证明对方认可本任期）
-            acks++;
-            if (resp.get().success()) {
-                synchronized (this) {
-                    nextIndex.put(peer, resp.get().matchIndex() + 1);
+            if (resp.get().grant()) {
+                acks++;
+                if (acks >= majority()) {
+                    quorumAt = System.nanoTime();
+                    break; // 多数派已确认，无需等待其余副本
                 }
-            }
-            if (acks >= majority()) {
-                quorumAt = System.nanoTime();
-                break; // 多数派已确认，无需等待其余副本
             }
         }
         if (acks < majority()) {
             // 始终没凑齐多数派：分区/宕机（不可达即时返回，不会拖到时限）
             return ReadResult.failed(RejectionReason.NO_QUORUM, nodeId);
         }
-        if (quorumAt < 0 || quorumAt > deadline) {
-            // 确认在时限之后才凑齐：响应迟迟未回，按超时失败
+        if (quorumAt > deadline) {
+            // 最后一票把多数派凑齐时已经越过时限（慢副本迟迟不回）：按超时失败，
+            // 与“始终够不到多数派”的 NO_QUORUM 明确区分
             return ReadResult.failed(RejectionReason.READ_CONFIRM_TIMEOUT, nodeId);
         }
         synchronized (this) {
             if (role != NodeRole.LEADER || currentTerm != term) {
                 return ReadResult.failed(RejectionReason.NO_LEADER, knownLeaderId);
             }
-            long readIndex = commitIndex;
-            return ReadResult.ok(term, readIndex, getCommittedEntries(), nodeId);
+            if (commitIndex < readIndex) {
+                // 防御性检查：提交索引只会单调前进；若异常回退则不返回数据
+                return ReadResult.failed(RejectionReason.NO_LEADER, knownLeaderId);
+            }
+            // 返回确认时刻的 readIndex 上界（不超过当前 commitIndex）
+            long snapshotIndex = Math.min(readIndex, commitIndex);
+            return ReadResult.ok(term, snapshotIndex,
+                    log.subList(0, (int) snapshotIndex), nodeId);
         }
     }
 

@@ -17,4 +17,10 @@ public interface Transport {
      * 向目标节点发送日志复制请求；目标不可达时返回空。
      */
     Optional<AppendResponse> sendAppendRequest(String targetId, AppendRequest request);
+
+    /**
+     * 向目标节点发送读前领导权确认请求；目标不可达时返回空。
+     * 该消息为纯查询：发送与接收双方都不得借此改变日志或提交索引。
+     */
+    Optional<ReadConfirmResponse> sendReadConfirm(String targetId, ReadConfirmRequest request);
 }
